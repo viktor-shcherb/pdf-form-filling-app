@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -33,6 +33,8 @@ const JOB_POLL_INTERVAL_MS = 2000
 const MANIFEST_CACHE_PREFIX = 'manifest_cache_'
 const MANIFEST_CACHE_MAX_AGE_SECONDS = 60 * 60 * 24
 const MANIFEST_CACHE_TTL_MS = 5 * 60 * 1000
+const COMPLETE_UPLOAD_STATUSES = new Set(['uploaded', 'extracted'])
+const FIELD_PROGRESS_STATUSES = ['filled', 'skipped', 'error']
 
 const ensureUserId = () => {
   if (typeof document === 'undefined') return 'local-user'
@@ -159,8 +161,29 @@ const apiFetch = async (path, options = {}) => {
 const statusLabelMap = {
   uploading: 'Uploading',
   uploaded: 'Uploaded',
+  extracted: 'Extracted',
   processing: 'Processing',
   error: 'Error',
+}
+
+const fieldStatusColor = (status) => {
+  switch (status) {
+    case 'filled':
+      return 'success'
+    case 'skipped':
+      return 'warning'
+    case 'error':
+      return 'error'
+    case 'prompting':
+      return 'info'
+    default:
+      return 'default'
+  }
+}
+
+const formatFieldStatusLabel = (status) => {
+  if (!status) return ''
+  return status.charAt(0).toUpperCase() + status.slice(1)
 }
 
 const jobStatusLabel = {
@@ -187,8 +210,11 @@ function App() {
   const [jobStatus, setJobStatus] = useState('idle')
   const [jobId, setJobId] = useState('')
   const [jobError, setJobError] = useState('')
+  const [jobMessage, setJobMessage] = useState('')
   const [filledFormUrl, setFilledFormUrl] = useState('')
   const [manifestLoading, setManifestLoading] = useState(true)
+  const [fieldProgress, setFieldProgress] = useState({ total: 0, filled: 0, skipped: 0, errors: 0 })
+  const [fieldStatuses, setFieldStatuses] = useState([])
   const pollTimer = useRef(null)
 
   const persistFilesToCache = useCallback(
@@ -287,7 +313,7 @@ function App() {
   }, [hydrateUploads])
 
   const formUrlIsValid = isValidHttpUrl(formUrl)
-  const allUploadsComplete = files.length > 0 && files.every((file) => file.status === 'uploaded')
+  const allUploadsComplete = files.length > 0 && files.every((file) => COMPLETE_UPLOAD_STATUSES.has(file.status))
   const canStartFill = formUrlIsValid && allUploadsComplete && jobStatus !== 'filling' && jobStatus !== 'queued'
 
   const updateFile = (id, next) => {
@@ -395,17 +421,36 @@ function App() {
     }
   }
 
+  const applyJobResponse = useCallback((response) => {
+    setJobStatus(response.status ?? 'queued')
+    setJobId(response.jobId ?? '')
+    setFilledFormUrl(response.filledFormUrl ?? '')
+    setJobMessage(response.message ?? '')
+    setFieldProgress({
+      total: response.totalFields ?? 0,
+      filled: response.filledFields ?? 0,
+      skipped: response.skippedFields ?? 0,
+      errors: response.errorFields ?? 0,
+    })
+    if (Array.isArray(response.fields)) {
+      setFieldStatuses(response.fields)
+    }
+    if (response.status === 'error') {
+      setJobError(response.message || 'Pipeline reported an error.')
+    } else {
+      setJobError('')
+    }
+  }, [])
+
   const scheduleJobPoll = (pollJobId, formLink) => {
     clearExistingPoll()
     pollTimer.current = setTimeout(async () => {
       try {
         const params = new URLSearchParams({ userId, formUrl: formLink })
         const response = await apiFetch(`/api/form-fill/${pollJobId}?${params}`)
-        setJobStatus(response.status)
-        setFilledFormUrl(response.filledFormUrl ?? '')
+        applyJobResponse(response)
 
         if (response.status === 'complete' || response.status === 'error') {
-          setJobError(response.status === 'error' ? 'Pipeline reported an error.' : '')
           clearExistingPoll()
         } else {
           scheduleJobPoll(pollJobId, formLink)
@@ -425,7 +470,10 @@ function App() {
     setJobStatus('queued')
     setJobId('')
     setJobError('')
+    setJobMessage('')
     setFilledFormUrl('')
+    setFieldProgress({ total: 0, filled: 0, skipped: 0, errors: 0 })
+    setFieldStatuses([])
 
     try {
       const formUrlSnapshot = formUrl
@@ -435,16 +483,9 @@ function App() {
         body: JSON.stringify({ userId, formUrl }),
       })
 
-      setJobId(response.jobId)
-      setJobStatus(response.status)
-      setFilledFormUrl(response.filledFormUrl ?? '')
+      applyJobResponse(response)
 
-      if (response.status === 'complete') {
-        return
-      }
-
-      if (response.status === 'error') {
-        setJobError('Pipeline reported an error.')
+      if (response.status === 'complete' || response.status === 'error') {
         return
       }
 
@@ -461,12 +502,29 @@ function App() {
     }
 
     const label = statusLabelMap[file.status] ?? file.status
-    const color = file.status === 'uploaded' ? 'success' : file.status === 'error' ? 'error' : 'info'
-    const variant = file.status === 'uploaded' ? 'outlined' : 'filled'
+    const isComplete = COMPLETE_UPLOAD_STATUSES.has(file.status)
+    const color = isComplete ? 'success' : file.status === 'error' ? 'error' : 'info'
+    const variant = isComplete ? 'outlined' : 'filled'
     return <Chip size="small" label={label} color={color} variant={variant} />
   }
 
   const showFileProgress = (file) => file.deleting || file.status === 'uploading' || file.status === 'processing'
+
+  const fieldProgressSummary = useMemo(() => {
+    const completed = Math.min(
+      fieldProgress.total,
+      fieldProgress.filled + fieldProgress.skipped + fieldProgress.errors,
+    )
+    const percent = fieldProgress.total > 0 ? Math.round((completed / fieldProgress.total) * 100) : 0
+    return { completed, percent }
+  }, [fieldProgress])
+
+  const recentFieldStatuses = useMemo(() => {
+    return fieldStatuses
+      .filter((field) => FIELD_PROGRESS_STATUSES.includes(field.status))
+      .slice(-5)
+      .reverse()
+  }, [fieldStatuses])
 
   return (
     <Box
@@ -647,7 +705,64 @@ function App() {
 
               {(jobStatus === 'queued' || jobStatus === 'filling') && <LinearProgress color="info" />}
 
+              {fieldProgress.total > 0 && (
+                <Stack spacing={1}>
+                  <Stack direction="row" justifyContent="space-between" alignItems="center">
+                    <Typography variant="body2" color="text.secondary">
+                      Fields processed: {fieldProgressSummary.completed}/{fieldProgress.total}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      Filled {fieldProgress.filled} • Skipped {fieldProgress.skipped} • Errors {fieldProgress.errors}
+                    </Typography>
+                  </Stack>
+                  <LinearProgress
+                    variant="determinate"
+                    value={fieldProgressSummary.percent}
+                    color="info"
+                  />
+                </Stack>
+              )}
+
+              {recentFieldStatuses.length > 0 && (
+                <Paper variant="outlined" sx={{ p: 2 }}>
+                  <Stack spacing={1}>
+                    <Typography variant="subtitle2">Recent field updates</Typography>
+                    {recentFieldStatuses.map((field) => (
+                      <Stack
+                        key={`${field.fieldName}-${field.status}-${field.value ?? ''}`}
+                        direction={{ xs: 'column', sm: 'row' }}
+                        spacing={1}
+                        justifyContent="space-between"
+                        alignItems={{ xs: 'flex-start', sm: 'center' }}
+                      >
+                        <Typography variant="body2" fontWeight={600}>
+                          {field.fieldName}
+                        </Typography>
+                        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                          <Chip
+                            size="small"
+                            label={formatFieldStatusLabel(field.status)}
+                            color={fieldStatusColor(field.status)}
+                          />
+                          {field.value && (
+                            <Typography variant="body2" color="text.secondary">
+                              {field.value}
+                            </Typography>
+                          )}
+                          {field.reason && (
+                            <Typography variant="body2" color="text.secondary">
+                              {field.reason}
+                            </Typography>
+                          )}
+                        </Stack>
+                      </Stack>
+                    ))}
+                  </Stack>
+                </Paper>
+              )}
+
               {jobError && <Alert severity="error">{jobError}</Alert>}
+              {jobMessage && jobStatus !== 'error' && <Alert severity="info">{jobMessage}</Alert>}
 
               {filledFormUrl && jobStatus === 'complete' && (
                 <Alert severity="success">
