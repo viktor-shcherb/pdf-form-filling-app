@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -25,6 +25,7 @@ import DeleteOutlineIcon from '@mui/icons-material/DeleteOutline'
 import InsertDriveFileOutlinedIcon from '@mui/icons-material/InsertDriveFileOutlined'
 import LaunchIcon from '@mui/icons-material/Launch'
 import PlayCircleOutlineIcon from '@mui/icons-material/PlayCircleOutline'
+import RefreshOutlinedIcon from '@mui/icons-material/RefreshOutlined'
 import './App.css'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -105,6 +106,11 @@ const mapManifestEntriesToState = (entries = []) =>
       persisted: true,
     }))
 
+const mergePersistedEntries = (persistedEntries, prevFiles) => {
+  const transient = prevFiles.filter((entry) => !entry.persisted)
+  return [...persistedEntries, ...transient]
+}
+
 const formatBytes = (bytes) => {
   if (!Number.isFinite(bytes)) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB']
@@ -182,15 +188,16 @@ function App() {
   const [jobId, setJobId] = useState('')
   const [jobError, setJobError] = useState('')
   const [filledFormUrl, setFilledFormUrl] = useState('')
-  const [manifestLoading, setManifestLoading] = useState(false)
+  const [manifestLoading, setManifestLoading] = useState(true)
   const pollTimer = useRef(null)
 
-  const persistFilesToCache = (nextFiles) => {
-    const manifestPayload = {
-      updatedAt: new Date().toISOString(),
-      files: nextFiles
-        .filter((file) => file.slug)
-        .map((file) => ({
+  const persistFilesToCache = useCallback(
+    (nextFiles) => {
+      const manifestPayload = {
+        updatedAt: new Date().toISOString(),
+        files: nextFiles
+          .filter((file) => file.slug)
+          .map((file) => ({
           status: file.status,
           slug: file.slug,
           fileName: file.name,
@@ -199,17 +206,69 @@ function App() {
         })),
     }
     writeManifestCache(userId, manifestPayload)
-  }
+    },
+    [userId],
+  )
 
-  const updateFiles = (updater, options = {}) => {
-    setFilesState((prev) => {
-      const next = typeof updater === 'function' ? updater(prev) : updater
-      if (!options.skipCache) {
-        persistFilesToCache(next)
+  const updateFiles = useCallback(
+    (updater, options = {}) => {
+      setFilesState((prev) => {
+        const next = typeof updater === 'function' ? updater(prev) : updater
+        if (!options.skipCache) {
+          persistFilesToCache(next)
+        }
+        return next
+      })
+    },
+    [persistFilesToCache],
+  )
+
+  const applyManifestEntries = useCallback(
+    (entries, options = {}) => {
+      updateFiles((prev) => mergePersistedEntries(entries, prev), options)
+    },
+    [updateFiles],
+  )
+
+  const hydrateUploads = useCallback(
+    async ({ ignoreCache = false, signal } = {}) => {
+      const isAborted = () => Boolean(signal?.aborted)
+
+      if (!ignoreCache) {
+        const cachedResult = readManifestCache(userId)
+        if (cachedResult?.data) {
+          const cachedEntries = mapManifestEntriesToState(cachedResult.data.files)
+          if (isAborted()) return
+          applyManifestEntries(cachedEntries, { skipCache: true })
+          setManifestError('')
+          if (!cachedResult.isStale) {
+            setManifestLoading(false)
+            return
+          }
+        }
       }
-      return next
-    })
-  }
+
+      if (isAborted()) return
+      setManifestLoading(true)
+
+      try {
+        const params = new URLSearchParams({ userId })
+        const response = await apiFetch(`/api/uploads?${params}`)
+        if (isAborted()) return
+
+        const persistedEntries = mapManifestEntriesToState(response.files ?? [])
+        applyManifestEntries(persistedEntries)
+        setManifestError('')
+      } catch (error) {
+        if (isAborted()) return
+        setManifestError(error.message || 'Failed to load previous uploads.')
+      } finally {
+        if (isAborted()) return
+        setManifestLoading(false)
+      }
+    },
+    [applyManifestEntries, userId],
+  )
 
   useEffect(() => {
     return () => {
@@ -220,64 +279,12 @@ function App() {
   }, [])
 
   useEffect(() => {
-    let cancelled = false
-
-    const cachedResult = readManifestCache(userId)
-    const cachedManifest = cachedResult?.data
-    if (cachedManifest) {
-      const cachedEntries = mapManifestEntriesToState(cachedManifest.files)
-      updateFiles(
-        (prev) => {
-          const transient = prev.filter((entry) => !entry.persisted)
-          return [...cachedEntries, ...transient]
-        },
-        { skipCache: true },
-      )
-      setManifestError('')
-    }
-
-    const shouldFetch = !cachedManifest || cachedResult?.isStale
-    setManifestLoading(!cachedManifest)
-
-    if (!shouldFetch) {
-      setManifestLoading(false)
-      return () => {
-        cancelled = true
-      }
-    }
-
-    const loadExistingUploads = async () => {
-      if (!cachedManifest) {
-        setManifestLoading(true)
-      }
-      try {
-        const params = new URLSearchParams({ userId })
-        const response = await apiFetch(`/api/uploads?${params}`)
-        if (cancelled) return
-
-        const persistedEntries = mapManifestEntriesToState(response.files ?? [])
-
-        updateFiles((prev) => {
-          const transient = prev.filter((entry) => !entry.persisted)
-          return [...persistedEntries, ...transient]
-        })
-        setManifestError('')
-      } catch (error) {
-        if (cancelled) return
-        setManifestError(error.message || 'Failed to load previous uploads.')
-      } finally {
-        if (!cancelled) {
-          setManifestLoading(false)
-        }
-      }
-    }
-
-    void loadExistingUploads()
-
+    const abortController = new AbortController()
+    void hydrateUploads({ signal: abortController.signal })
     return () => {
-      cancelled = true
+      abortController.abort()
     }
-  }, [userId])
+  }, [hydrateUploads])
 
   const formUrlIsValid = isValidHttpUrl(formUrl)
   const allUploadsComplete = files.length > 0 && files.every((file) => file.status === 'uploaded')
@@ -314,6 +321,10 @@ function App() {
     })
 
     event.target.value = ''
+  }
+
+  const handleRefreshUploads = () => {
+    void hydrateUploads({ ignoreCache: true })
   }
 
   const uploadDocument = async (entryId, file) => {
@@ -500,16 +511,31 @@ function App() {
             <Divider />
 
             <Stack spacing={2}>
-              <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <Stack direction={{ xs: 'column', sm: 'row' }} alignItems={{ xs: 'flex-start', sm: 'center' }} justifyContent="space-between" spacing={1}>
                 <Typography variant="h6">Supporting documents</Typography>
-                <Tooltip title="Upload PDFs or images one at a time (16 MB cap)">
-                  <span>
-                    <Button component="label" startIcon={<CloudUploadIcon />} variant="contained" color="primary">
-                      Upload Files
-                      <input type="file" hidden multiple onChange={handleFilesSelected} />
-                    </Button>
-                  </span>
-                </Tooltip>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Tooltip title="Upload PDFs or images one at a time (16 MB cap)">
+                    <span>
+                      <Button component="label" startIcon={<CloudUploadIcon />} variant="contained" color="primary">
+                        Upload Files
+                        <input type="file" hidden multiple onChange={handleFilesSelected} />
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title="Fetch the latest data from the backend">
+                    <span>
+                      <Button
+                        variant="outlined"
+                        color="secondary"
+                        startIcon={<RefreshOutlinedIcon />}
+                        onClick={handleRefreshUploads}
+                        disabled={manifestLoading}
+                      >
+                        Refresh
+                      </Button>
+                    </span>
+                  </Tooltip>
+                </Stack>
               </Stack>
               <Typography variant="caption" color="text.secondary">
                 Files upload immediately and include the form link once you provide it. Add the link before starting the
@@ -518,14 +544,16 @@ function App() {
 
               {manifestError && <Alert severity="warning">{manifestError}</Alert>}
 
-              {manifestLoading ? (
-                <Paper variant="outlined" sx={{ p: 3, textAlign: 'center', borderStyle: 'dashed' }}>
-                  <Typography color="text.secondary">Loading your saved files...</Typography>
-                </Paper>
-              ) : files.length === 0 ? (
-                <Paper variant="outlined" sx={{ p: 3, textAlign: 'center', borderStyle: 'dashed' }}>
-                  <Typography color="text.secondary">No uploads yet. Add files to kick things off.</Typography>
-                </Paper>
+              {files.length === 0 ? (
+                manifestLoading ? (
+                  <Paper variant="outlined" sx={{ p: 3, textAlign: 'center', borderStyle: 'dashed' }}>
+                    <Typography color="text.secondary">Loading your saved files...</Typography>
+                  </Paper>
+                ) : (
+                  <Paper variant="outlined" sx={{ p: 3, textAlign: 'center', borderStyle: 'dashed' }}>
+                    <Typography color="text.secondary">No uploads yet. Add files to kick things off.</Typography>
+                  </Paper>
+                )
               ) : (
                 <List disablePadding sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
                   {files.map((file) => (
